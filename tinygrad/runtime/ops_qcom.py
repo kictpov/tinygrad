@@ -28,6 +28,20 @@ def dcache_flush():
   ps = get_program(UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg="CPU"), UOp(Ops.LINEAR, src=tuple(sink.toposort())))), Device["CPU"].renderer)
   return Device["CPU"].runtime(ps.function_name, ps.lib)
 
+@functools.cache
+def dcache_invalidate():
+  """Clean and Invalidate CPU dcache lines - use before reading data written by GPU"""
+  from tinygrad.uop.ops import UOp, Ops, KernelInfo
+  from tinygrad.codegen import get_program
+  buf, n = UOp(Ops.PARAM, dtypes.uint8.ptr(), arg=0), UOp(Ops.PARAM, dtypes.uint8.ptr(), arg=1)
+  i = UOp.range(n.cast(dtypes.int), 0, dtype=dtypes.int)
+  # dc civac = Clean and Invalidate by VA to PoC
+  inv = UOp(Ops.CUSTOM, dtypes.void, (buf.cast(dtypes.ulong) + i.cast(dtypes.ulong) * UOp.const(dtypes.ulong, 64),),
+            arg='__asm__ volatile("dc civac, %0" :: "r"({0}) : "memory");')
+  sink = UOp.sink(inv.end(i), UOp(Ops.CUSTOM, dtypes.void, (), arg='__asm__ volatile("dsb sy" ::: "memory");'), arg=KernelInfo(name="dcache_invalidate"))
+  ps = get_program(UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg="CPU"), UOp(Ops.LINEAR, src=tuple(sink.toposort())))), Device["CPU"].renderer)
+  return Device["CPU"].runtime(ps.function_name, ps.lib)
+
 #Parse C-style defines: <regname>_<field_x>__SHIFT and <regname>_<field_y>__MASK from the adreno module into the following format:
 # qreg.<regname>(<field_x>=..., <field_y>=..., ..., <field_n>=...)
 def _qreg_exec(__reg, __val=0, **kwargs):
@@ -71,9 +85,18 @@ class QCOMComputeQueue(HWQueue):
   def reg(self, reg: int, *vals: int): self.q(pkt4_hdr(reg, len(vals)), *vals)
 
   def _cache_flush(self, write_back=True, invalidate=False, sync=True, memsync=False):
-    # TODO: 7xx support.
-    if write_back: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, *data64_le(self.dev.dummy_addr), 0) # dirty cache write-back.
-    if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
+    if self.dev.gpu_id[:2] < (7, 3):
+      if write_back: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, *data64_le(self.dev.dummy_addr), 0) # dirty cache write-back.
+      if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
+    else:
+      # A7XX path: use CP_EVENT_WRITE7
+      if write_back:
+        self.cmd(mesa.CP_EVENT_WRITE7,
+                 qreg.cp_event_write7_0(event=mesa.CACHE_FLUSH_TS, write_src=mesa.EV_WRITE_USER_32B,
+                                        write_dst=mesa.EV_DST_RAM, write_enabled=True),
+                 *data64_le(self.dev.dummy_addr), 0, 0)
+      if invalidate:
+        self.cmd(mesa.CP_EVENT_WRITE7, qreg.cp_event_write7_0(event=mesa.CACHE_INVALIDATE))
     if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
     if sync: self.cmd(mesa.CP_WAIT_FOR_IDLE)
 
@@ -84,11 +107,16 @@ class QCOMComputeQueue(HWQueue):
   def signal(self, signal:QCOMSignal, value=0):
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
     if self.dev.gpu_id[:2] < (7, 3):
+      # A6XX path
       self.cmd(mesa.CP_EVENT_WRITE, qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS), *data64_le(signal.value_addr), lo32(value))
-      self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     else:
-      # TODO: support devices starting with 8 Gen 1. Also, 700th series have convenient CP_GLOBAL_TIMESTAMP and CP_LOCAL_TIMESTAMP
-      raise RuntimeError('CP_EVENT_WRITE7 is not supported')
+      # A7XX path: use CP_EVENT_WRITE7 packet
+      # payload[0]=value (32-bit), payload[1]=0, dst=RAM @ signal.value_addr
+      self.cmd(mesa.CP_EVENT_WRITE7,
+               qreg.cp_event_write7_0(event=mesa.CACHE_FLUSH_TS, write_src=mesa.EV_WRITE_USER_32B,
+                                      write_dst=mesa.EV_DST_RAM, write_enabled=True),
+               *data64_le(signal.value_addr), lo32(value), 0)
+    self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     return self
 
   def timestamp(self, signal:QCOMSignal):
@@ -137,10 +165,20 @@ class QCOMComputeQueue(HWQueue):
     self.reg(mesa.REG_A6XX_TPL1_DBG_ECO_CNTL, 0)
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
 
-    self.reg(mesa.REG_A6XX_SP_CS_NDRANGE_0,
-             qreg.a6xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
-             global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=mesa.THREAD64),
-             cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
+    if self.dev.gpu_id[:2] >= (7, 3):
+      # A7XX: NDRANGE registers at 0xa9d4+, WGE_CNTL at 0xa9db (no CONST_CONFIG_0!)
+      # Layout: NDRANGE_0~6, WGE_CNTL, KERNEL_GROUP_X/Y/Z, NDRANGE_7
+      self.reg(mesa.REG_A7XX_SP_CS_NDRANGE_0,
+               qreg.a7xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
+               global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0,
+               qreg.a7xx_sp_cs_wge_cntl(linearlocalidregid=prg.lid if prg.NIR else 0xfc, threadsize=mesa.THREAD64),
+               cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True),
+               qreg.a7xx_sp_cs_ndrange_7(localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1))
+    else:
+      self.reg(mesa.REG_A6XX_SP_CS_NDRANGE_0,
+               qreg.a6xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
+               global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=mesa.THREAD64),
+               cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
 
     self.reg(mesa.REG_A6XX_SP_CS_CNTL_0,
              qreg.a6xx_sp_cs_cntl_0(threadsize=mesa.THREAD64, halfregfootprint=prg.hregs, fullregfootprint=prg.fregs, branchstack=prg.brnchstck),
@@ -157,7 +195,13 @@ class QCOMComputeQueue(HWQueue):
                                                              state_block=mesa.SB6_CS_SHADER, num_unit=round_up(prg.image_size, 128) // 128),
              *data64_le(prg.lib_gpu.va_addr))
 
-    self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc, qreg.a6xx_sp_cs_const_config(constlen=1024 // 4, enabled=True))
+    if self.dev.gpu_id[:2] >= (7, 3):
+      # A7XX: REG_PROG_ID at 0xa9c8-0xa9cb, gap at 0xa9cc, CONST_CONFIG at 0xa9cd
+      # Must split writes because 0xa9cc is unknown
+      self.reg(mesa.REG_A7XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc)
+      self.reg(mesa.REG_A7XX_SP_CS_CONST_CONFIG, qreg.a7xx_sp_cs_const_config(constlen=1024 // 4, enabled=True))
+    else:
+      self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc, qreg.a6xx_sp_cs_const_config(constlen=1024 // 4, enabled=True))
 
     self.reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(prg.hw_stack_offset))
     self.reg(mesa.REG_A6XX_SP_CS_INSTR_SIZE, qreg.a6xx_sp_cs_instr_size(prg.image_size // 4))
@@ -185,9 +229,19 @@ class QCOMComputeQueue(HWQueue):
              qreg.a6xx_sp_cs_config(enabled=True, nsamp=args_state.prg.samp_cnt, ntex=args_state.prg.tex_cnt, nuav=args_state.prg.ibo_cnt))
 
     if prg.NIR:
-      self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
-               qreg.a6xx_sp_cs_const_config_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz, wgoffsetconstid=0xfc, localidregid=prg.lid),
-               qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=mesa.THREAD64))
+      if self.dev.gpu_id[:2] >= (7, 3):
+        # A7XX: CONST_CONFIG_0 (0xb997) doesn't exist. Use WIE_CNTL_0 (0xa9c2) + WIE_CNTL_1 (0xa9c3).
+        # WIE_CNTL_0 has the same layout as A6XX CONST_CONFIG_0: wgid/wgsz/wgoffset/localidregid
+        # WIE_CNTL_1 has linearlocalidregid + threadsize
+        # On A7XX, localidregid (3D) may not be functional, but wgid/wgsz/wgoffset MUST be set.
+        # WGE_CNTL (0xa9db) has linearlocalidregid already set in NDRANGE block above.
+        self.reg(mesa.REG_A6XX_SP_CS_WIE_CNTL_0,
+                 qreg.a6xx_sp_cs_wie_cntl_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz, wgoffsetconstid=0xfc, localidregid=prg.lid),
+                 qreg.a7xx_sp_cs_wie_cntl_1(linearlocalidregid=prg.lid, threadsize=mesa.THREAD64))
+      else:
+        self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
+                 qreg.a6xx_sp_cs_const_config_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz, wgoffsetconstid=0xfc, localidregid=prg.lid),
+                 qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=mesa.THREAD64))
       self.cmd(mesa.CP_EXEC_CS, 0,
                qreg.cp_exec_cs_1(ngroups_x=global_size[0]), qreg.cp_exec_cs_2(ngroups_y=global_size[1]), qreg.cp_exec_cs_3(_ngroups_z=global_size[2]))
     else: self.cmd(mesa.CP_RUN_OPENCL, 0)
@@ -326,7 +380,11 @@ class QCOMTextureInfo:
 
 class QCOMAllocator(HCQAllocatorBase):
   def _alloc(self, size:int, opts:BufferSpec) -> HCQBuffer:
-    return self.dev._gpu_map(opts.external_ptr, size) if opts.external_ptr else self.dev._gpu_alloc(size)
+    if opts.external_ptr:
+      return self.dev._gpu_map(opts.external_ptr, size)
+    # Use uncached memory for A7XX to avoid CPU-GPU cache coherence issues
+    use_uncached = self.dev.gpu_id[:2] >= (7, 3)
+    return self.dev._gpu_alloc(size, uncached=use_uncached)
 
   def _do_copy(self, src_addr, dest_addr, size, prof_text):
     with cpu_profile(prof_text, f"{self.dev.device}:COPY"): ctypes.memmove(dest_addr, src_addr, size)
@@ -336,7 +394,6 @@ class QCOMAllocator(HCQAllocatorBase):
 
   def _copyout(self, dest:memoryview, src:HCQBuffer):
     self.dev.synchronize()
-
     self._do_copy(src.cpu_view().addr, mv_address(dest), src.size, f"{self.dev.device} -> TINY")
 
   def _as_buffer(self, src:HCQBuffer) -> memoryview:
@@ -373,9 +430,9 @@ class QCOMDevice(HCQCompiled):
     self.gpu_id = (info.chip_id >> 24, (info.chip_id >> 16) & 0xFF, (info.chip_id >> 8) & 0xFF)
 
     # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
-    if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={info.chip_id:#x}")
+    if self.gpu_id[:2] >= (7, 3): print(f"WARNING: A7XX GPU detected: chip_id={info.chip_id:#x}, gpu_id={self.gpu_id} - experimental")
 
-    if PROFILE and self.gpu_id[:2] < (7, 3):
+    if PROFILE:
       System.write_sysfs("/sys/class/kgsl/kgsl-3d0/idle_timer", value="4000000000", msg="Failed to disable suspend mode", expected="4294967276")
 
     compilers = CompilerSet(ctrl_var=QCOM_CC, cset=[(functools.partial(QCOMCLRenderer, info.chip_id), None),
