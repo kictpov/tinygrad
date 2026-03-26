@@ -171,7 +171,9 @@ class QCOMComputeQueue(HWQueue):
       self.reg(mesa.REG_A7XX_SP_CS_NDRANGE_0,
                qreg.a7xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
                global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0,
-               qreg.a7xx_sp_cs_wge_cntl(linearlocalidregid=prg.lid if prg.NIR else 0xfc, threadsize=mesa.THREAD64),
+               qreg.a7xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=mesa.THREAD64,
+                                         workgrouprastorderzfirsten=True, wgtilewidth=4,
+                                         wgtileheight=(17 if local_size[1] % 8 == 0 else 9 if local_size[1] % 4 == 0 else 5 if local_size[1] % 2 == 0 else 3)),
                cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True),
                qreg.a7xx_sp_cs_ndrange_7(localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1))
     else:
@@ -237,7 +239,7 @@ class QCOMComputeQueue(HWQueue):
         # WGE_CNTL (0xa9db) has linearlocalidregid already set in NDRANGE block above.
         self.reg(mesa.REG_A6XX_SP_CS_WIE_CNTL_0,
                  qreg.a6xx_sp_cs_wie_cntl_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz, wgoffsetconstid=0xfc, localidregid=prg.lid),
-                 qreg.a7xx_sp_cs_wie_cntl_1(linearlocalidregid=prg.lid, threadsize=mesa.THREAD64))
+                 qreg.a7xx_sp_cs_wie_cntl_1(linearlocalidregid=0xfc, threadsize=mesa.THREAD64, workitemrastorder=mesa.WORKITEMRASTORDER_TILED))
       else:
         self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
                  qreg.a6xx_sp_cs_const_config_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz, wgoffsetconstid=0xfc, localidregid=prg.lid),
