@@ -4,6 +4,28 @@ from tinygrad.helpers import OSX, getenv, capstone_flatdump, DEBUG, unwrap
 from tinygrad.runtime.support.elf import jit_loader
 from tinygrad.runtime.autogen import llvm
 
+def _arm_disabled_features() -> tuple[str, str]:
+  """Detect ARM ISA features that hardware supports but OS kernel has disabled (e.g. SVE on Android).
+  Returns (clang_suffix, llvm_features) to append to compiler flags."""
+  if platform.machine() not in ('aarch64', 'arm64'): return ('', '')
+  try:
+    with open('/proc/cpuinfo') as f:
+      os_feats = set()
+      for line in f:
+        if line.startswith('Features'):
+          os_feats = set(line.split(':')[1].strip().split())
+          break
+    clang_dis, llvm_dis = [], []
+    if 'sve' not in os_feats:
+      clang_dis += ['nosve', 'nosve2']
+      llvm_dis += ['-sve', '-sve2', '-sve2-bitperm', '-sve2-aes', '-sve2-sha3', '-sve2-sm4']
+    if 'sme' not in os_feats:
+      clang_dis += ['nosme', 'nosme2']
+      llvm_dis += ['-sme', '-sme2', '-sme-f64f64', '-sme-i16i64']
+    return ('+'.join([''] + clang_dis) if clang_dis else '', (','.join(llvm_dis)).encode() if llvm_dis else b'')
+  except (FileNotFoundError, PermissionError): return ('', '')
+
+
 class ClangJITCompiler(Compiler):
   def __init__(self, cachekey="compile_clang_jit"): super().__init__(cachekey)
 
@@ -13,7 +35,8 @@ class ClangJITCompiler(Compiler):
     # x18 is a reserved platform register. It is clobbered on context switch in macos and is used to store TEB pointer in windows on arm, don't use it
     target = 'x86_64' if sys.platform == 'win32' else platform.machine()
     # on arm march means "runs on this arch and superset" instead of "optimize for this arch". x86 march == arm mcpu
-    arch = {'x86_64': '-march=native', 'AMD64': '-march=native', 'riscv64': '-march=rv64g'}.get(platform.machine(), "-mcpu=native")
+    clang_dis, _ = _arm_disabled_features()
+    arch = {'x86_64': '-march=native', 'AMD64': '-march=native', 'riscv64': '-march=rv64g'}.get(platform.machine(), f"-mcpu=native{clang_dis}")
     args = [arch, f'--target={target}-none-unknown-elf', '-O2', '-fPIC', '-ffreestanding', '-fno-math-errno', '-nostdlib', '-fno-ident']
     arch_args = ['-ffixed-x18'] if target == 'arm64' else []
     return subprocess.check_output([getenv("CC", 'clang'), '-c', '-x', 'c', *args, *arch_args, '-', '-o', '-'], input=src.encode('utf-8'))
@@ -89,5 +112,6 @@ class LLVMCompiler(Compiler):
 class CPULLVMCompiler(LLVMCompiler):
   def __init__(self, cache_key=None):
     # +reserve-x18 here does the same thing as -ffixed-x18 in ops_cpu.py, see comments there for why it's needed on arm osx
-    cpu, feats = ctypes.string_at(llvm.LLVMGetHostCPUName()), (b'+reserve-x18,' if OSX else b'') + ctypes.string_at(llvm.LLVMGetHostCPUFeatures())
+    _, llvm_dis = _arm_disabled_features()
+    cpu, feats = ctypes.string_at(llvm.LLVMGetHostCPUName()), (b'+reserve-x18,' if OSX else b'') + ctypes.string_at(llvm.LLVMGetHostCPUFeatures()) + (b',' + llvm_dis if llvm_dis else b'')
     super().__init__(cpu.decode(), feats.decode(), cache_key)
