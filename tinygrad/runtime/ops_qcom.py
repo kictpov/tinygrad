@@ -248,7 +248,10 @@ class QCOMComputeQueue(HWQueue):
                qreg.cp_exec_cs_1(ngroups_x=global_size[0]), qreg.cp_exec_cs_2(ngroups_y=global_size[1]), qreg.cp_exec_cs_3(_ngroups_z=global_size[2]))
     else: self.cmd(mesa.CP_RUN_OPENCL, 0)
 
-    self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
+    if self.dev.gpu_id[:2] >= (7, 3):
+      self._cache_flush(write_back=True, invalidate=True, sync=False, memsync=True)
+    else:
+      self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     return self
 
 class QCOMArgsState(HCQArgsState):
