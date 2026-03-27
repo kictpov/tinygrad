@@ -96,7 +96,7 @@ class QCOMComputeQueue(HWQueue):
                                         write_dst=mesa.EV_DST_RAM, write_enabled=True),
                  *data64_le(self.dev.dummy_addr), 0, 0)
       if invalidate:
-        self.cmd(mesa.CP_EVENT_WRITE7, qreg.cp_event_write7_0(event=mesa.CACHE_INVALIDATE))
+        self.cmd(mesa.CP_EVENT_WRITE7, qreg.cp_event_write7_0(event=mesa.CACHE_INVALIDATE7))
     if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
     if sync: self.cmd(mesa.CP_WAIT_FOR_IDLE)
 
