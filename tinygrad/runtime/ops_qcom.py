@@ -69,7 +69,7 @@ class QCOMSignal(HCQSignal):
   def _sleep(self, time_spent_since_last_sleep_ms:int):
     # Sleep only for timeline signals. Do it immediately to free cpu.
     if self.is_timeline and self.owner is not None:
-      kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.owner.fd, context_id=self.owner.ctx, timestamp=self.owner.last_cmd, timeout=0xffffffff)
+      kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.owner.fd, context_id=self.owner.ctx, timestamp=self.owner.last_cmd, timeout=500)
 
 class QCOMComputeQueue(HWQueue):
   def __init__(self, dev:QCOMDevice):
@@ -225,7 +225,8 @@ class QCOMComputeQueue(HWQueue):
       self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST6_UAV, state_src=mesa.SS6_INDIRECT,
                                                                state_block=mesa.SB6_CS_SHADER, num_unit=args_state.prg.ibo_cnt),
                *data64_le(args_state.buf.va_addr + args_state.prg.ibo_off))
-      self.reg(mesa.REG_A6XX_SP_CS_UAV_BASE, *data64_le(args_state.buf.va_addr + args_state.prg.ibo_off))
+      uav_base_reg = mesa.REG_A7XX_SP_CS_UAV_BASE if self.dev.gpu_id[:2] >= (7, 3) else mesa.REG_A6XX_SP_CS_UAV_BASE
+      self.reg(uav_base_reg, *data64_le(args_state.buf.va_addr + args_state.prg.ibo_off))
 
     self.reg(mesa.REG_A6XX_SP_CS_CONFIG,
              qreg.a6xx_sp_cs_config(enabled=True, nsamp=args_state.prg.samp_cnt, ntex=args_state.prg.tex_cnt, nuav=args_state.prg.ibo_cnt))
@@ -249,7 +250,7 @@ class QCOMComputeQueue(HWQueue):
     else: self.cmd(mesa.CP_RUN_OPENCL, 0)
 
     if self.dev.gpu_id[:2] >= (7, 3):
-      self._cache_flush(write_back=True, invalidate=True, sync=False, memsync=True)
+      self._cache_flush(write_back=True, invalidate=True, sync=True, memsync=True)
     else:
       self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     return self
@@ -316,8 +317,8 @@ class QCOMProgram(HCQProgram):
     to_mv(self.lib_gpu.va_addr, self.image_size)[:] = self.image
 
     self.pvtmem_size_per_item: int = round_up(self.pvtmem, 512) >> 9
-    self.pvtmem_size_total: int = self.pvtmem_size_per_item * 128 * 2
-    self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * 128 * 16, 0x1000)
+    self.pvtmem_size_total: int = self.pvtmem_size_per_item * (48 if dev.gpu_id[:2] >= (7, 3) else 128 * 2) | (0x80000000 if dev.gpu_id[:2] >= (7, 3) else 0)
+    self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * (48 if dev.gpu_id[:2] >= (7, 3) else 128) * 16, 0x1000)
     self.shared_size: int = max(1, (self.shmem - 1) // 1024)
     self.max_threads = min(1024, ((384 * 32) // (max(1, (self.fregs + round_up(self.hregs, 2) // 2)) * 128)) * 128)
     dev._ensure_stack_size(self.hw_stack_offset * 4)
